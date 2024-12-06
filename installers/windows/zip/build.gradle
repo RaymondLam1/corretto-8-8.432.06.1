@@ -1,0 +1,210 @@
+/*
+* Copyright (c) 2019, Amazon.com, Inc. or its affiliates. All Rights Reserved.
+* DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+*
+* This code is free software; you can redistribute it and/or modify it
+* under the terms of the GNU General Public License version 2 only, as
+* published by the Free Software Foundation. Amazon designates this
+* particular file as subject to the "Classpath" exception as provided
+* by Oracle in the LICENSE file that accompanied this code.
+*
+* This code is distributed in the hope that it will be useful, but WITHOUT
+* ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+* FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
+* version 2 for more details (a copy is included in the LICENSE file that
+* accompanied this code).
+*
+* You should have received a copy of the GNU General Public License version
+* 2 along with this work; if not, write to the Free Software Foundation,
+* Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+configurations {
+    javafx
+}
+
+import java.nio.file.Paths
+
+dependencies {
+    javafx project(path: ':javafx', configuration: 'archives')
+    compile project(path: ':openjdksrc', configuration: 'archives')
+}
+
+def imagesDir = file("$buildRoot/build/$jdkImageName/images")
+def packagingDir = file("$buildDir/packaging")
+
+task copySource(type: Copy) {
+    dependsOn project.configurations.compile
+    from tarTree(project.configurations.compile.singleFile)
+    into buildRoot
+}
+
+task createJavafxOverlay(type: Copy) {
+    dependsOn project.configurations.javafx
+    from tarTree(project.configurations.javafx.singleFile)
+    into "$buildDir/javafx"
+    eachFile {
+        if (it.path.startsWith('rt/')) {
+            it.path = it.path.replace('rt/', 'jre/')
+        }
+    }
+    includeEmptyDirs = false
+}
+
+task configureBuild(type: Exec) {
+    dependsOn copySource
+    workingDir "$buildRoot"
+    // Platform specific flags
+    def command = ['bash', 'configure',
+            "--with-boot-jdk=${project.getProperty('bootjdk_dir')}",
+            "--with-freetype=${project.getProperty('freetype_dir')}"]
+    // Common flags
+    command += project.correttoCommonFlags
+    commandLine command.flatten()
+}
+
+task executeBuild(type: Exec) {
+    dependsOn configureBuild
+    workingDir "$buildRoot"
+
+    commandLine 'make', 'clean', 'images'
+}
+
+task applyJavafxOverlay() {
+    dependsOn createJavafxOverlay
+    outputs.dir(packagingDir)
+    doLast {
+        copy {
+            from createJavafxOverlay.destinationDir
+            into "$imagesDir/j2sdk-image"
+        }
+
+        copy {
+            from "$createJavafxOverlay.destinationDir/jre"
+            into "$imagesDir/j2re-image"
+        }
+    }
+}
+
+task copyImages() {
+    dependsOn createJavafxOverlay
+    dependsOn executeBuild
+    dependsOn applyJavafxOverlay
+
+    outputs.dir(packagingDir)
+    doLast {
+        // Copy jdk
+        copy {
+            from "$imagesDir/j2sdk-image"
+            exclude '**/*.diz'
+            into "$packagingDir/jdk"
+        }
+        // Copy jre
+        copy {
+            from "$imagesDir/j2re-image"
+            exclude '**/*.diz'
+            into "$packagingDir/jre"
+        }
+        // Copy jdk debug symbols
+        copy {
+            from "$imagesDir/j2sdk-image"
+            include '**/*.diz'
+            into "$packagingDir/jdk-symbols"
+        }
+    }
+}
+
+task importAmazonCacerts(type: Exec) {
+    dependsOn copyImages
+    outputs.dir(packagingDir)
+    workingDir "$imagesDir/j2sdk-image"
+    // Default password for JSSE key store
+    def keystore_password = "changeit"
+    commandLine 'keytool', '-importkeystore', '-noprompt',
+            '-srckeystore', "$buildRoot/amazon-cacerts",
+            '-srcstorepass', keystore_password,
+            '-destkeystore', "$packagingDir/jdk/jre/lib/security/cacerts",
+            '-deststorepass', keystore_password
+}
+
+task copyCacerts(type: Copy) {
+    dependsOn importAmazonCacerts
+    from file("$packagingDir/jdk/jre/lib/security/cacerts")
+    into file("$packagingDir/jre/lib/security")
+}
+
+task fixPermissions() {
+    dependsOn copyCacerts
+    def rel = Paths.get("$packagingDir/placeholder").relativize(imagesDir.toPath())
+    outputs.dir(packagingDir)
+    doLast {
+        exec {
+            workingDir "$packagingDir/jdk"
+            commandLine 'bash', '-c', "find . -exec chmod --reference=\$(cygpath -u \'$rel\')/j2sdk-image/{} {} \\;"
+        }
+        exec {
+            workingDir "$packagingDir/jre"
+            commandLine 'bash', '-c', "find . -exec chmod --reference=\$(cygpath -u \'$rel\')/j2re-image/{} {} \\;"
+        }
+        exec {
+            workingDir "$packagingDir/jdk-symbols"
+            commandLine 'bash', '-c', "find . -exec chmod --reference=\$(cygpath -u \'$rel\')/j2sdk-image/{} {} \\;"
+        }
+    }
+}
+
+task copyVersionInfo() {
+    dependsOn fixPermissions
+    outputs.dir(packagingDir)
+    doLast {
+        // Copy version.txt into JDK
+        copy {
+            from "$buildRoot"
+            include "commitId.txt"
+            include "version.txt"
+            into "$packagingDir/jdk"
+        }
+        // Copy version.txt into JRE
+        copy {
+            from "$buildRoot"
+            include "commitId.txt"
+            include "version.txt"
+            into "$packagingDir/jre"
+        }
+    }
+}
+
+task packageDebugSymbols(type: Exec) {
+    dependsOn copyVersionInfo
+    outputs.dir(distributionDir)
+    distributionDir.mkdirs()
+    def archiveName = file("$distributionDir/unsigned-jdk-debugsymbols-image.${project.correttoArch}.zip")
+    workingDir "$packagingDir/jdk-symbols"
+    commandLine 'bash', '-c', "zip -qr \$(cygpath -u \'$archiveName\') *"
+    artifacts.add('archives', archiveName)
+}
+
+task packageJdk(type: Exec) {
+    dependsOn copyVersionInfo
+    outputs.dir(distributionDir)
+    distributionDir.mkdirs()
+    def archiveName = file("$distributionDir/unsigned-jdk-image.${project.correttoArch}.zip")
+    workingDir "$packagingDir/jdk"
+    commandLine 'bash', '-c', "zip -qr \$(cygpath -u \'$archiveName\') *"
+    artifacts.add('archives', archiveName)
+}
+
+task packageJre(type: Exec) {
+    dependsOn copyVersionInfo
+    outputs.dir(distributionDir)
+    distributionDir.mkdirs()
+    def archiveName = file("$distributionDir/unsigned-jre-image.${project.correttoArch}.zip")
+    workingDir "$packagingDir/jre"
+    commandLine 'bash', '-c', "zip -qr \$(cygpath -u \'$archiveName\') *"
+    artifacts.add('archives', archiveName)
+}
+
+build {
+    dependsOn packageDebugSymbols
+    dependsOn packageJre
+    dependsOn packageJdk
+}
